@@ -9,9 +9,9 @@ __pycache__/
 *.py[cod]
 
 # Runtime / generated data (keep folder via .gitkeep)
-data/*
+
 !data/.gitkeep
 
 # Local seed documents (keep folder via .gitkeep)
-seed/*
+
 !seed/.gitkeep
