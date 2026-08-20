@@ -1,6 +1,6 @@
 # Company Knowledge Assistant
 
-A RAG (Retrieval-Augmented Generation) app that answers questions from company documents. Documents are ingested into Postgres with **pgvector**, embedded with **OpenAI**, and queried through a FastAPI backend with a simple web UI.
+A RAG (Retrieval-Augmented Generation) app that answers questions from company documents. Documents are ingested into Postgres with **pgvector**, embedded with **OpenAI**, and queried through a FastAPI backend , indexing with **HNSWIndex** and a simple web UI.
 
 ## Features
 
@@ -8,33 +8,36 @@ A RAG (Retrieval-Augmented Generation) app that answers questions from company d
 - Store embeddings in PostgreSQL + pgvector (`vector(1536)`)
 - Build an **HNSW** vector index after ingest for fast similarity search
 - Ask grounded questions via ChatGPT (`gpt-4o-mini`) with source citations
-- Optional LangSmith tracing for debugging LLM / retrieval chains
-- Docker Compose setup (app + Postgres)
+- LangSmith tracing for debugging LLM / retrieval chains
+- Docker Compose deployment: **both** the FastAPI app and Postgres run as containers
 
 ## Architecture
 
 ```
-Browser (UI)
+Browser (UI)  →  http://localhost:8000
     │
     ▼
-FastAPI (app/api.py)
-    ├── POST /ingest  → load → chunk → embed → pgvector → HNSW index
-    └── POST /ask     → embed question → HNSW retrieve → LLM answer
-                │
-                ▼
-     Postgres + pgvector + HNSW (cka-db)
+┌─────────────────────────────────────┐
+│  Docker Compose                     │
+│                                     │
+│  cka-app (FastAPI / Uvicorn)        │
+│    ├── POST /ingest → embed + HNSW  │
+│    └── POST /ask    → retrieve+LLM  │
+│           │                         │
+│           ▼  (hostname: postgres)   │
+│  cka-db (Postgres 17 + pgvector)    │
+└─────────────────────────────────────┘
 ```
 
 | Component | Technology |
 |-----------|------------|
-| API / UI | FastAPI, Uvicorn, static HTML |
+| API / UI | FastAPI, Uvicorn, static HTML (`cka-app` container) |
 | Embeddings | OpenAI `text-embedding-3-small` (1536 dims) |
 | LLM | OpenAI `gpt-4o-mini` |
-| Vector DB | Postgres 17 + pgvector |
+| Vector DB | Postgres 17 + pgvector (`cka-db` container) |
 | Vector index | HNSW (cosine distance) via `langchain_postgres` |
 | Orchestration | LangChain (retrieval + stuff documents chain) |
-| Containers | Docker Compose (`cka-app`, `cka-db`) |
-
+| Deployment | Docker Compose — **app and Postgres both in containers** |
 ## Project structure
 
 ```
@@ -58,9 +61,11 @@ knowledge-assistant/
 
 ## Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (recommended)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - OpenAI API key
 - (Optional) LangSmith API key for tracing
+
+Both the **application** and **Postgres** are started with Docker Compose. You do not need a local Python venv or a local Postgres install for the standard deployment.
 
 ## Environment variables
 
@@ -87,7 +92,7 @@ LANGSMITH_PROJECT=cka
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | Async Postgres URL. Inside Docker use host `postgres`; locally use `localhost`. |
+| `DATABASE_URL` | Yes | Async Postgres URL. In Docker Compose the host **must** be `postgres` (the Compose service name), not `localhost`. |
 | `DATA_DIR` | No | Document root (default: `data`) |
 | `OPENAI_API_KEY` | Yes | OpenAI key for embeddings and chat |
 | `RETRIEVAL_K` | No | Top-k chunks for RAG (default: `5`) |
@@ -97,21 +102,42 @@ LANGSMITH_PROJECT=cka
 
 **Important:** Never commit `.env`. GitHub push protection will block pushes that contain secrets.
 
-## Quick start (Docker)
+## Docker deployment
+
+This project is deployed with **Docker Compose**. Both services run as containers:
+
+| Service | Container | Role | Port |
+|---------|-----------|------|------|
+| `app` | `cka-app` | FastAPI + UI (Uvicorn) | `8000` |
+| `postgres` | `cka-db` | Postgres + pgvector | `5432` |
+
+The app reaches the database over the Compose network using hostname **`postgres`** (see `DATABASE_URL` in `.env`). Host code is bind-mounted into `cka-app` (`.:/app`) so app file changes are reflected without rebuilding, unless `requirements.txt` / `Dockerfile` change.
 
 ### 1. Configure `.env`
 
-Copy the template above and set your `OPENAI_API_KEY`.
+Copy the template above and set your `OPENAI_API_KEY`. Keep:
 
-### 2. Start services
+```env
+DATABASE_URL=postgresql+asyncpg://postgres:postgres123@postgres:5432/rag_db
+```
+
+### 2. Start both containers
 
 ```powershell
 cd D:\github\knowledge-assistant
 docker compose up --build -d
 ```
 
-- App: http://localhost:8000  
-- Postgres: `localhost:5432` (user `postgres`, password `postgres123`, db `rag_db`)
+This starts **Postgres and the app** together. Confirm:
+
+```powershell
+docker compose ps
+```
+
+You should see `cka-db` (healthy) and `cka-app` running.
+
+- App / UI: http://localhost:8000  
+- Postgres (optional host tools): `localhost:5432` — user `postgres`, password `postgres123`, database `rag_db`
 
 ### 3. Add documents
 
@@ -131,6 +157,8 @@ data/
 ```
 
 Supported extensions: `.txt`, `.md`, `.pdf`, `.docx`
+
+The `data/` folder is available inside the app container via the volume mount.
 
 ### 4. Ingest
 
@@ -253,46 +281,29 @@ docker compose down -v
 docker compose up --build -d
 ```
 
-## Local development (hybrid)
-
-Run only Postgres in Docker; run the app on the host:
+## Common Docker commands
 
 ```powershell
-docker compose up postgres -d
-
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-# Host must use localhost, not "postgres"
-$env:DATABASE_URL = "postgresql+asyncpg://postgres:postgres123@localhost:5432/rag_db"
-$env:DATA_DIR = "data"
-$env:OPENAI_API_KEY = "sk-your-key"
-$env:RETRIEVAL_K = "5"
-
-uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
-```
-
-## Common commands
-
-```powershell
-# Start / stop
+# Start both containers (app + postgres)
 docker compose up -d
+
+# Stop both
 docker compose down
 
-# Rebuild after requirements.txt changes
+# Rebuild app image after requirements.txt / Dockerfile changes, then recreate
 docker compose build app
-docker compose up -d --force-recreate app
+docker compose up -d --force-recreate
 
-# Logs
+# Logs (app or both services)
 docker compose logs -f app
+docker compose logs -f
 docker compose logs app --tail 100
 
-# Check env inside container
+# Check env inside the app container
 docker compose exec app printenv DATABASE_URL
 docker compose exec app printenv OPENAI_API_KEY
 
-# Reset DB volume (destructive)
+# Reset DB volume (destructive) and restart both containers
 docker compose down -v
 docker compose up --build -d
 ```
