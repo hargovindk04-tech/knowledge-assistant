@@ -8,7 +8,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import UnstructuredMarkdownLoader, PyMuPDFLoader, UnstructuredWordDocumentLoader,TextLoader
 
 from .utils import get_vector_store
-
+from langchain_postgres.v2.indexes import HNSWIndex, DistanceStrategy
 
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -62,6 +62,15 @@ def _chunk(docs: List[Document]) -> List[Document]:
         traceback.print_exc()
         raise
 
+async def _create_index(store):
+    index = HNSWIndex(
+        name="hnsw_idx",
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+        m=16,
+        ef_construction=64
+    )
+    await store.aapply_vector_index(index,concurrently=True)
+    print("Index Created Succesfully")
 
 
 async def run_ingest_async() -> dict:
@@ -70,7 +79,7 @@ async def run_ingest_async() -> dict:
     store = await get_vector_store()
     await store.aadd_documents(chunks)
     print(f"INGEST: {len(docs)} docs, {len(chunks)} chunks")
-    
+    await _create_index(store)
 
     return {"documents": len(docs),"chunks":len(chunks)}
 
