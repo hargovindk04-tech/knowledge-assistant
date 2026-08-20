@@ -17,18 +17,9 @@ langchain-postgres
 asyncpg
 
 
-# Ingestion helpers
+# Ingestion
 unstructured
-unstructured[pdf]
 unstructured[docx]
-unstructured[image]
 markdown
 pytesseract
 pymupdf
-
-
-# Embeddings (CPU-only — avoids ~2GB NVIDIA CUDA packages)
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-sentence-transformers
-langchain-huggingface
