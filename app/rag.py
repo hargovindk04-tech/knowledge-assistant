@@ -1,0 +1,58 @@
+from typing import List, Tuple
+import os
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.docstore.document import Document
+
+from langchain_core .globals import set_llm_cache
+
+
+from .utils import get_vector_store
+
+
+
+
+
+
+SYSTEM = """You are a grounded company knowledge assistant.
+Always base answers strictly on the provided context.
+If the answer isn't present, reply with "I don't know."
+Respond concisely and clearly.
+"""
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM),
+    ("user",
+     "Question:\n{input}\n\n"
+     "Context:\n{context}\n\n"
+     "Rule: Prefer the most recent policy by effective date.")
+])
+
+
+async def _build_chain():
+    store = await get_vector_store()  
+    search_kwargs={"k": int(os.getenv("RETRIEVAL_K","5"))}
+   
+    retriever = store.as_retriever(search_kwargs=search_kwargs)
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    doc_chain = create_stuff_documents_chain(llm, PROMPT)
+    rag_chain = create_retrieval_chain(retriever, doc_chain)
+    return rag_chain
+
+
+
+async def answer_with_docs_async(question: str) -> Tuple[str, List[str],List[str]]:
+    chain = await _build_chain()
+    result = await chain.ainvoke({"input": question})
+    answer: str = result["answer"]
+
+    sources = []
+    docs: List[Document] = result["context"]
+    
+    unique_sources = {d.metadata.get("source") for d in docs}
+    sources = sorted(unique_sources)
+
+    return answer, sources

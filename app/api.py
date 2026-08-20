@@ -7,8 +7,9 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
-
+from pydantic import BaseModel
 from .ingest import run_ingest_async
+from .rag import answer_with_docs_async
 
 app = FastAPI(title="Knowledge Assistant")
 
@@ -27,6 +28,8 @@ _ingest_last = {
     "error": None,
 }
 
+class Ask(BaseModel):
+    question: str
 
 @app.get("/")
 async def root_page():
@@ -57,3 +60,22 @@ async def kick_off_ingest():
 @app.get("/ingest/status")
 async def ingest_status():
     return {"ok": True, **_ingest_last}    
+
+@app.post("/ask")
+async def ask(q: Ask):
+    start = time.perf_counter()
+    
+    #TODO: Call RAG
+    
+   
+    answer, sources   = await answer_with_docs_async(q.question)
+
+    elapsed = time.perf_counter() - start
+    print(f"⏱️ /ask execution took {elapsed:.2f} seconds")
+    
+
+    return {
+        "answer": answer,         
+        "sources": sources
+       
+    }
