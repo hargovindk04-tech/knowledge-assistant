@@ -1,6 +1,6 @@
 # Company Knowledge Assistant
 
-A RAG (Retrieval-Augmented Generation) app that answers questions from company documents. Documents are ingested into Postgres with **pgvector**, embedded with **OpenAI**, and queried through a FastAPI backend , indexing with **HNSWIndex** and a simple web UI.
+A RAG (Retrieval-Augmented Generation) app that answers questions from company documents. Documents are ingested into Postgres with **pgvector**, embedded with **OpenAI**, indexed with **HNSW**, and queried through a FastAPI backend with a simple web UI. Similar questions are accelerated with a **Redis semantic LLM cache**.
 
 ## Features
 
@@ -8,8 +8,9 @@ A RAG (Retrieval-Augmented Generation) app that answers questions from company d
 - Store embeddings in PostgreSQL + pgvector (`vector(1536)`)
 - Build an **HNSW** vector index after ingest for fast similarity search
 - Ask grounded questions via ChatGPT (`gpt-4o-mini`) with source citations
+- **Redis semantic cache** so similar questions can reuse prior LLM answers
 - LangSmith tracing for debugging LLM / retrieval chains
-- Docker Compose deployment: **both** the FastAPI app and Postgres run as containers
+- Docker Compose deployment: **app, Postgres, and Redis** all run as containers
 
 ## Architecture
 
@@ -17,27 +18,32 @@ A RAG (Retrieval-Augmented Generation) app that answers questions from company d
 Browser (UI)  →  http://localhost:8000
     │
     ▼
-┌─────────────────────────────────────┐
-│  Docker Compose                     │
-│                                     │
-│  cka-app (FastAPI / Uvicorn)        │
-│    ├── POST /ingest → embed + HNSW  │
-│    └── POST /ask    → retrieve+LLM  │
-│           │                         │
-│           ▼  (hostname: postgres)   │
-│  cka-db (Postgres 17 + pgvector)    │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  Docker Compose                              │
+│                                              │
+│  cka-app (FastAPI / Uvicorn)                 │
+│    ├── POST /ingest → embed + HNSW           │
+│    └── POST /ask    → cache? retrieve + LLM  │
+│           │                    │             │
+│           ▼                    ▼             │
+│  cka-db (Postgres+pgvector)  cka-redis       │
+│     hostname: postgres         Redis Stack   │
+│                              hostname:       │
+│                              cka-redis       │
+└──────────────────────────────────────────────┘
 ```
 
 | Component | Technology |
 |-----------|------------|
-| API / UI | FastAPI, Uvicorn, static HTML (`cka-app` container) |
+| API / UI | FastAPI, Uvicorn, static HTML (`cka-app`) |
 | Embeddings | OpenAI `text-embedding-3-small` (1536 dims) |
 | LLM | OpenAI `gpt-4o-mini` |
-| Vector DB | Postgres 17 + pgvector (`cka-db` container) |
+| Vector DB | Postgres 17 + pgvector (`cka-db`) |
 | Vector index | HNSW (cosine distance) via `langchain_postgres` |
-| Orchestration | LangChain (retrieval + stuff documents chain) |
-| Deployment | Docker Compose — **app and Postgres both in containers** |
+| LLM cache | Redis Stack + `RedisSemanticCache` (`cka-redis`) |
+| Orchestration | LangChain retrieval + stuff-documents chain |
+| Deployment | Docker Compose — **app, Postgres, and Redis** in containers |
+
 ## Project structure
 
 ```
@@ -45,14 +51,14 @@ knowledge-assistant/
 ├── app/
 │   ├── api.py          # FastAPI routes: /, /ingest, /ingest/status, /ask
 │   ├── ingest.py       # Document load, chunk, embed, HNSW index
-│   ├── rag.py          # Retrieval + LLM answer chain
+│   ├── rag.py          # RAG chain + Redis semantic LLM cache
 │   ├── utils.py        # PGEngine, embeddings, vector store factory
 │   └── static/         # Web UI (index.html, CSS)
 ├── data/               # Source documents to ingest (by category folders)
 ├── init-db/
 │   └── init.sql        # Creates extension + embedding table
 ├── seed/               # Optional seed assets
-├── docker-compose.yml
+├── docker-compose.yml  # app + postgres + redis
 ├── Dockerfile
 ├── requirements.txt
 ├── .env                # Secrets (not committed)
@@ -65,14 +71,14 @@ knowledge-assistant/
 - OpenAI API key
 - (Optional) LangSmith API key for tracing
 
-Both the **application** and **Postgres** are started with Docker Compose. You do not need a local Python venv or a local Postgres install for the standard deployment.
+The **application**, **Postgres**, and **Redis** are all started with Docker Compose. You do not need a local Python venv, Postgres, or Redis install for the standard deployment.
 
 ## Environment variables
 
 Create a `.env` file in the project root (already gitignored):
 
 ```env
-# Database — use hostname "postgres" inside Docker Compose
+# Database — use hostname "postgres" (Compose service name)
 DATABASE_URL=postgresql+asyncpg://postgres:postgres123@postgres:5432/rag_db
 
 # Folder of documents to ingest
@@ -88,14 +94,18 @@ RETRIEVAL_K=5
 LANGCHAIN_TRACING_V2=true
 LANGSMITH_API_KEY=lsv2_your-langsmith-key
 LANGSMITH_PROJECT=cka
+
+# Redis semantic LLM cache (Compose service / container hostname)
+REDIS_URL=redis://cka-redis:6379/0
 ```
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | Async Postgres URL. In Docker Compose the host **must** be `postgres` (the Compose service name), not `localhost`. |
+| `DATABASE_URL` | Yes | Async Postgres URL. Host **must** be `postgres`, not `localhost`. |
 | `DATA_DIR` | No | Document root (default: `data`) |
 | `OPENAI_API_KEY` | Yes | OpenAI key for embeddings and chat |
 | `RETRIEVAL_K` | No | Top-k chunks for RAG (default: `5`) |
+| `REDIS_URL` | Yes (for cache) | Redis URL. Host **must** be `cka-redis` (container name) inside Compose. |
 | `LANGCHAIN_TRACING_V2` | No | Enable LangSmith tracing |
 | `LANGSMITH_API_KEY` | No | LangSmith auth |
 | `LANGSMITH_PROJECT` | No | LangSmith project name (e.g. `cka`) |
@@ -104,14 +114,17 @@ LANGSMITH_PROJECT=cka
 
 ## Docker deployment
 
-This project is deployed with **Docker Compose**. Both services run as containers:
+This project is deployed with **Docker Compose**. All three services run as containers:
 
-| Service | Container | Role | Port |
-|---------|-----------|------|------|
+| Service | Container | Role | Ports |
+|---------|-----------|------|-------|
 | `app` | `cka-app` | FastAPI + UI (Uvicorn) | `8000` |
 | `postgres` | `cka-db` | Postgres + pgvector | `5432` |
+| `redis` | `cka-redis` | Redis Stack (semantic LLM cache) | `6379`, `8001` (RedisInsight UI) |
 
-The app reaches the database over the Compose network using hostname **`postgres`** (see `DATABASE_URL` in `.env`). Host code is bind-mounted into `cka-app` (`.:/app`) so app file changes are reflected without rebuilding, unless `requirements.txt` / `Dockerfile` change.
+- App → Postgres over the Compose network using hostname **`postgres`**
+- App → Redis using hostname **`cka-redis`** (see `REDIS_URL`)
+- Host code is bind-mounted into `cka-app` (`.:/app`) so app file changes apply without rebuild, unless `requirements.txt` / `Dockerfile` change
 
 ### 1. Configure `.env`
 
@@ -119,25 +132,28 @@ Copy the template above and set your `OPENAI_API_KEY`. Keep:
 
 ```env
 DATABASE_URL=postgresql+asyncpg://postgres:postgres123@postgres:5432/rag_db
+REDIS_URL=redis://cka-redis:6379/0
 ```
 
-### 2. Start both containers
+### 2. Start all containers
 
 ```powershell
 cd D:\github\knowledge-assistant
 docker compose up --build -d
 ```
 
-This starts **Postgres and the app** together. Confirm:
+This starts **Postgres, Redis, and the app**. Confirm:
 
 ```powershell
 docker compose ps
 ```
 
-You should see `cka-db` (healthy) and `cka-app` running.
+You should see `cka-db`, `cka-redis`, and `cka-app` running.
 
 - App / UI: http://localhost:8000  
 - Postgres (optional host tools): `localhost:5432` — user `postgres`, password `postgres123`, database `rag_db`
+- Redis: `localhost:6379`
+- RedisInsight UI: http://localhost:8001
 
 ### 3. Add documents
 
@@ -183,6 +199,8 @@ curl -X POST http://localhost:8000/ask `
   -H "Content-Type: application/json" `
   -d "{\"question\": \"What is the PTO policy?\"}"
 ```
+
+Ask a similar question again — if the Redis semantic cache hits, `/ask` is typically much faster.
 
 ## API reference
 
@@ -246,13 +264,64 @@ Called at the end of `run_ingest_async()` after `aadd_documents(...)`.
 
 Without an index, search still works for small datasets but gets slower as you add more documents. Re-run **Ingest Data** after large data changes so the index stays useful.
 
+## Redis semantic LLM cache
+
+`/ask` uses LangChain’s global LLM cache backed by **Redis Stack** (`RedisSemanticCache` in `app/rag.py`).
+
+```python
+from langchain_core.globals import set_llm_cache
+from langchain_redis import RedisSemanticCache
+from langchain_openai import OpenAIEmbeddings
+
+REDIS_URL = os.getenv("REDIS_URL")
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+set_llm_cache(
+    RedisSemanticCache(
+        redis_url=REDIS_URL,
+        embeddings=embeddings,
+        distance_threshold=0.98,
+    )
+)
+```
+
+| Setting | Value | Meaning |
+|---------|-------|---------|
+| `redis_url` | from `REDIS_URL` | Redis connection (`redis://cka-redis:6379/0`) |
+| `embeddings` | `text-embedding-3-small` | Embeds prompts to find *similar* cached calls |
+| `distance_threshold` | `0.98` | How close a new prompt must be to reuse a cached answer (higher = stricter match) |
+
+### Behavior
+
+- First ask for a question: full RAG + OpenAI call (slower)
+- Later asks that are semantically very similar: may hit the Redis cache (faster)
+- Exact wording is not required — similarity is embedding-based
+- Cache lives in the `redis-data` Docker volume
+
+### Dependencies
+
+From `requirements.txt`:
+
+```text
+redis
+langchain-redis
+```
+
+Rebuild the app image after adding these packages:
+
+```powershell
+docker compose build app
+docker compose up -d --force-recreate
+```
+
 ## How ask (RAG) works
 
-1. Embed the question (OpenAI)
-2. Retrieve top-`RETRIEVAL_K` similar chunks from pgvector (HNSW-backed)
-3. Stuff context into a grounded system prompt
-4. Generate answer with `gpt-4o-mini`
-5. Return answer + unique source paths
+1. Check Redis semantic LLM cache for a similar prior prompt
+2. Embed the question (OpenAI) if needed
+3. Retrieve top-`RETRIEVAL_K` similar chunks from pgvector (HNSW-backed)
+4. Stuff context into a grounded system prompt
+5. Generate answer with `gpt-4o-mini` (or reuse cached LLM result)
+6. Return answer + unique source paths
 
 Answers are instructed to stay within retrieved context; if the answer is not present, the model should say **"I don't know."**
 
@@ -274,7 +343,7 @@ CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
 
 `1536` matches OpenAI `text-embedding-3-small`. Changing embedding models requires matching this dimension and re-ingesting.
 
-To reset the database (re-runs `init.sql`):
+To reset Postgres **and** Redis volumes (destructive):
 
 ```powershell
 docker compose down -v
@@ -284,26 +353,28 @@ docker compose up --build -d
 ## Common Docker commands
 
 ```powershell
-# Start both containers (app + postgres)
+# Start all containers (app + postgres + redis)
 docker compose up -d
 
-# Stop both
+# Stop all
 docker compose down
 
 # Rebuild app image after requirements.txt / Dockerfile changes, then recreate
 docker compose build app
 docker compose up -d --force-recreate
 
-# Logs (app or both services)
+# Logs
 docker compose logs -f app
 docker compose logs -f
 docker compose logs app --tail 100
+docker compose logs redis --tail 50
 
 # Check env inside the app container
 docker compose exec app printenv DATABASE_URL
+docker compose exec app printenv REDIS_URL
 docker compose exec app printenv OPENAI_API_KEY
 
-# Reset DB volume (destructive) and restart both containers
+# Reset DB + Redis volumes (destructive) and restart everything
 docker compose down -v
 docker compose up --build -d
 ```
@@ -312,12 +383,14 @@ docker compose up --build -d
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Connect call failed ... 127.0.0.1:5432` | App in Docker using `localhost` for DB | Set `DATABASE_URL` host to `postgres` |
+| `Connect call failed ... 127.0.0.1:5432` | App using `localhost` for DB | Set `DATABASE_URL` host to `postgres` |
+| Redis connection errors | Wrong host / Redis not up | Set `REDIS_URL=redis://cka-redis:6379/0`; `docker compose up -d redis` |
 | `Missing credentials` / OpenAI error | No API key | Set `OPENAI_API_KEY` in `.env`, recreate app |
-| `ModuleNotFoundError: pymupdf` / `unstructured` | Deps missing in image | Update `requirements.txt`, `docker compose build app` |
+| `ModuleNotFoundError: langchain_redis` / `redis` | Deps missing in image | Update `requirements.txt`, `docker compose build app` |
 | Ingest “succeeds” but files skipped | Per-file errors caught in ingest | Check `docker compose logs app` for `INGEST ERROR` |
 | Dimension mismatch | Table dims ≠ embedding model | Align `init.sql` (`1536` for OpenAI), reset volume, re-ingest |
-| `/ask` times vary (1s–10s+) | OpenAI latency; no response cache | Expected; optional LLM cache / chain reuse |
+| First `/ask` slow, similar asks faster | Semantic cache miss then hit | Expected with Redis cache |
+| Similar ask still slow | Threshold too strict / different prompt | Adjust `distance_threshold` or clear Redis volume |
 | Push rejected (GH013 secrets) | `.env` committed with API keys | Remove `.env` from git history, rotate keys, keep `.env` gitignored |
 | Container unhealthy | Healthcheck hits `/health` (not implemented) | App can still work at `/`; ignore or add a `/health` route |
 
