@@ -23,3 +23,7 @@ unstructured[docx]
 markdown
 pytesseract
 pymupdf
+
+#Caching
+redis
+langchain-redis

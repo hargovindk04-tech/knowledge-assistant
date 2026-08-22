@@ -8,6 +8,8 @@ from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.docstore.document import Document
 
 from langchain_core .globals import set_llm_cache
+from langchain_redis import RedisSemanticCache
+
 
 
 from .utils import get_vector_store
@@ -31,7 +33,17 @@ PROMPT = ChatPromptTemplate.from_messages([
      "Rule: Prefer the most recent policy by effective date.")
 ])
 
+REDIS_URL = os.getenv("REDIS_URL")
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
+
+set_llm_cache(
+    RedisSemanticCache(
+        redis_url=REDIS_URL,
+        embeddings =embeddings,
+        distance_threshold = 0.98
+    )
+)
 async def _build_chain():
     store = await get_vector_store()  
     search_kwargs={"k": int(os.getenv("RETRIEVAL_K","5"))}
